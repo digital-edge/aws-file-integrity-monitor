@@ -1,0 +1,405 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS resources for file integrity monitoring using Lambda, DynamoDB, and SNS.
+Parameters:
+  EmailRecipients:
+    Type: String
+    Default: test@domain.com
+    Description: "Comma separated list of email recipients"
+  FilesJson:
+    Type: String
+    Default: '{}'
+    Description: "JSON string with list of instances and files to monitor, see documentaion for format details"
+Resources:
+
+  FileIntegrityLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt FileIntegrityLambdaExecutionRole.Arn
+      Runtime: python3.11
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          import os
+
+          def handler(event, context):
+              ssm_client = boto3.client('ssm')
+              dynamodb = boto3.resource('dynamodb')
+              sns = boto3.client('sns')
+              
+              # DynamoDB tables configuration
+              current_table = dynamodb.Table(os.environ['CurrentFileHashesTable'])
+              history_table = dynamodb.Table(os.environ['FileHashHistoryTable'])
+              topic_arn = os.environ['FileIntegrityAlertTopic']
+
+              # List of EC2 instance IDs and their respective files to check along with OS type, with the following format
+              # instances_files = {
+              #     'i-0123456789abcdefg': {'os': 'Windows', 'files': ['D:\Sites\MySite1\web.config', 'D:\Sites\MySite2\Web.config']},
+              #     'i-9876543210gfedcba': {'os': 'Linux', 'files': ['/local/sites/mysite/settings.php']}
+              # }
+
+              instances_files = json.loads(os.environ['FilesJson'])
+
+              print(f'Got FilesJson: {instances_files}')
+
+              # Command templates for different OS types
+              commands = {
+                  'Windows': "Get-FileHash -Path '{}' -Algorithm MD5 | Select-Object -ExpandProperty Hash",
+                  'Linux': "md5sum '{}' | cut -d ' ' -f 1"
+              }
+
+              for instance_id, details in instances_files.items():
+                  os_type = details['os']
+                  files = details['files']
+                  command_template = commands[os_type]
+
+                  for file in files:
+                      # Sending command to the instance via SSM
+                      response = ssm_client.send_command(
+                          InstanceIds=[instance_id],
+                          DocumentName="AWS-RunShellScript" if os_type == 'Linux' else "AWS-RunPowerShellScript",
+                          Parameters={'commands': [command_template.format(file)]},
+                          TimeoutSeconds=300
+                      )
+                      command_id = response['Command']['CommandId']
+                      status = 'Pending'
+
+                      # Polling the status of the command until it is no longer pending or in progress
+                      while status in ['Pending', 'InProgress']:
+                          time.sleep(10)  # sleep 10 seconds before checking the status again
+                          invocation_response = ssm_client.get_command_invocation(
+                              CommandId=command_id,
+                              InstanceId=instance_id
+                          )
+                          status = invocation_response['Status']
+                          if status in ['Cancelled', 'TimedOut', 'Failed']:
+                              print(f"Command did not complete successfully: {status}")
+                              continue
+
+                      # Once complete, fetch the output
+                      current_hash = invocation_response['StandardOutputContent'].strip().split()[0]
+
+                      # Retrieve the stored hash from DynamoDB
+                      stored_hash_response = current_table.get_item(
+                          Key={
+                              'InstanceId': instance_id,
+                              'FilePath': file
+                          }
+                      )
+                      stored_hash = stored_hash_response.get('Item', {}).get('FileHash', '')
+
+                      if not stored_hash:
+
+                          # Send an alert if hashes do not match
+                          alert_message = f"File integrity, new file added to configuration! Instance: {instance_id}, File: {file}"
+                          sns.publish(
+                              TopicArn=topic_arn,
+                              Message=alert_message,
+                              Subject="File Integrity Alert"
+                          )
+                          
+                          # If no stored hash, store the current hash in DynamoDB
+                          current_table.put_item(
+                              Item={
+                                  'InstanceId': instance_id,
+                                  'FilePath': file,
+                                  'FileHash': current_hash
+                              }
+                          )
+
+                          # Log this change in the FileHashHistory table
+                          history_table.put_item(
+                              Item={
+                                  'InstanceId': instance_id,
+                                  'FilePath': file,
+                                  'FileHash': current_hash,
+                                  'Timestamp': int(time.time())
+                              }
+                          )
+                          print(f"Stored new hash for {file} on instance {instance_id}")
+
+                      elif current_hash != stored_hash:
+                          # Send an alert if hashes do not match
+                          alert_message = f"File integrity issue detected! Instance: {instance_id}, File: {file}"
+                          sns.publish(
+                              TopicArn=topic_arn,
+                              Message=alert_message,
+                              Subject="File Integrity Alert"
+                          )
+                          # Update the hash in the CurrentFileHashes table
+                          current_table.update_item(
+                              Key={
+                                  'InstanceId': instance_id,
+                                  'FilePath': file
+                              },
+                              UpdateExpression='SET FileHash = :val',
+                              ExpressionAttributeValues={
+                                  ':val': current_hash
+                              }
+                          )
+                          # Log this change in the FileHashHistory table
+                          history_table.put_item(
+                              Item={
+                                  'InstanceId': instance_id,
+                                  'FilePath': file,
+                                  'FileHash': current_hash,
+                                  'Timestamp': int(time.time())
+                              }
+                          )
+                          print(f"Updated hash for {file} on instance {instance_id} and logged in history")
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('File integrity check completed.')
+              }
+
+      Environment:
+        Variables:
+          CurrentFileHashesTable: !Ref CurrentFileHashes
+          FileHashHistoryTable: !Ref FileHashHistory
+          FileIntegrityAlertTopic: !Ref FileIntegrityAlertTopic
+          FilesJson: !Ref FilesJson
+      Timeout: 300
+
+  FileIntegrityLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Policies:
+        - PolicyName: FileIntegrityLambdaExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Scan"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:UpdateItem"
+                Resource: 
+                  - !GetAtt CurrentFileHashes.Arn
+                  - !GetAtt FileHashHistory.Arn
+              - Effect: Allow
+                Action:
+                  - "sns:Publish"
+                Resource: !Ref FileIntegrityAlertTopic
+              - Effect: Allow
+                Action:
+                  - "ssm:SendCommand"
+                  - "ssm:GetCommandInvocation"
+                Resource: "*"
+
+  CurrentFileHashes:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "InstanceId"
+          AttributeType: "S"
+        - AttributeName: "FilePath"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "InstanceId"
+          KeyType: "HASH"
+        - AttributeName: "FilePath"
+          KeyType: "RANGE"
+      BillingMode: PAY_PER_REQUEST
+
+  FileHashHistory:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: "InstanceId"
+          AttributeType: "S"
+        - AttributeName: "Timestamp"
+          AttributeType: "N"
+        - AttributeName: "FilePath"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "InstanceId"
+          KeyType: "HASH"
+        - AttributeName: "Timestamp"
+          KeyType: "RANGE"
+      GlobalSecondaryIndexes:
+        - IndexName: "FilePathIndex"
+          KeySchema:
+            - AttributeName: "FilePath"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+      BillingMode: PAY_PER_REQUEST
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Trigger Lambda every hour for file integrity check"
+      ScheduleExpression: "cron(0/15 * * * ? *)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt FileIntegrityLambda.Arn
+          Id: "FileIntegrityCheck"
+
+  LambdaPermissionForEvents:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FileIntegrityLambda.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventRule.Arn
+
+  InvocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [events.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Policies:
+        - PolicyName: InvocationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["lambda:InvokeFunction"]
+                Resource: !GetAtt FileIntegrityLambda.Arn
+
+  FileIntegrityAlertTopic:
+    Type: AWS::SNS::Topic
+
+  SubscriptionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "root"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: 
+                  - "sns:ListSubscriptionsByTopic"
+                  - "sns:Subscribe"
+                  - "sns:Unsubscribe"
+                Resource: !Ref FileIntegrityAlertTopic
+              - Effect: "Allow"
+                Action: "logs:*"
+                Resource: "arn:aws:logs:*:*:*"
+
+  SubscriptionLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.handler"
+      Role: !GetAtt SubscriptionLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+
+          def handler(event, context):
+              
+              print(event)
+
+              sns = boto3.client('sns')
+              response_data = {}
+              
+              try:
+                  topic_arn = event['ResourceProperties']['TopicArn']
+                  input_email_list = set(email.strip().lower() for email in event['ResourceProperties']['EmailList'].split(','))
+                  
+                  if event['RequestType'] in ['Create', 'Update']:
+                      existing_subscriptions = get_current_subscriptions(sns, topic_arn)
+
+                      print(f'Got existing subcriptions {existing_subscriptions}')
+
+                      current_emails = set(sub['Endpoint'].lower() for sub in existing_subscriptions if sub['Protocol'] == 'email')
+                      
+                      print(f'Current emails: {current_emails}')
+                      print(f'New emails: {input_email_list}')
+
+                      emails_to_subscribe = input_email_list - current_emails
+                      emails_to_unsubscribe = current_emails - input_email_list
+
+                      print(f'Emails to subscribe: {emails_to_subscribe}')
+                      print(f'Email to unsubscribe: {emails_to_unsubscribe}')
+
+                      # Subscribe new emails
+                      for email in emails_to_subscribe:
+
+                          print(f'Creating subcription for {email}')
+                          sns.subscribe(
+                              TopicArn=topic_arn,
+                              Protocol='email',
+                              Endpoint=email
+                          )
+
+                      # Unsubscribe emails that are no longer in the list
+                      for sub in existing_subscriptions:
+                          if sub['Endpoint'].lower() in emails_to_unsubscribe and sub['Protocol'] == 'email':
+                              email = sub['Endpoint'].lower()
+                              if sub['SubscriptionArn'] == 'PendingConfirmation':
+                                  print(f'Subscription for {email} is pending and will be removed automatically in 3 days.')
+                              else:
+                                  print(f'Removing subcription for {email}')
+                                  
+                                  sns.unsubscribe(
+                                      SubscriptionArn=sub['SubscriptionArn']
+                                  )
+                              
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+                  elif event['RequestType'] == 'Delete':
+
+                      # return SUCCESS, no actions needed
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  response_data['Error'] = str(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+          def get_current_subscriptions(sns, topic_arn):
+              """ Retrieve current subscribers' emails to the topic """
+              subscriptions = []
+              next_token = None
+              while True:
+                  if next_token:
+                      response = sns.list_subscriptions_by_topic(TopicArn=topic_arn, NextToken=next_token)
+                  else:
+                      response = sns.list_subscriptions_by_topic(TopicArn=topic_arn)
+                      
+                      subscriptions.extend(response['Subscriptions'])
+                      next_token = response.get('NextToken', None)
+                  if not next_token:
+                      break
+                  
+              return subscriptions
+      Runtime: "python3.11"
+      Timeout: "30"
+
+  SubscriptionCustomResource:
+    Type: "Custom::SubscriptionResource"
+    Properties:
+      ServiceToken: !GetAtt SubscriptionLambdaFunction.Arn
+      EmailList: !Ref EmailRecipients
+      TopicArn: !Ref FileIntegrityAlertTopic
